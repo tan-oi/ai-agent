@@ -43,3 +43,11 @@ export async function createMeetClient() {
     auth,
   });
 }
+
+export async function createSheetsClient() {
+  const auth = await getGoogleAuth();
+  return google.sheets({
+    version: "v4",
+    auth,
+  });
+}

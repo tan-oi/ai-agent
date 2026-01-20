@@ -70,7 +70,12 @@ export async function readDocument(documentId: string) {
         style: res.data.documentStyle,
       },
     };
-  } catch (err) {}
+   } catch (err: any) {
+     return {
+       success: false,
+       error: err.message || "Failed to read document",
+     };
+   }
 }
 
 export async function createDocument(title: string, content?: string) {

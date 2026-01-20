@@ -1,119 +1,158 @@
 import { z } from "zod";
-import { Experimental_Agent as Agent, stepCountIs, tool } from "ai";
+import {
+  Experimental_Agent as Agent,
+  convertToModelMessages,
+  stepCountIs,
+  tool,
+} from "ai";
 import { readEmailFunction, sendEmailFunction } from "@/functions/google/gmail";
 import { NextResponse } from "next/server";
 import { groq } from "@ai-sdk/groq";
 import { auth } from "@/lib/auth";
 import { headers } from "next/headers";
 import { createDocument, readDocument } from "@/functions/google/docs";
+import { streamText } from "ai";
+import { findFreeSlots } from "@/functions/google/calender";
+import { createSpreadSheet, readSheet } from "@/functions/google/sheets";
 
 export async function POST(req: Request) {
   try {
     const userAuth = await auth.api.getSession({
       headers: await headers(),
     });
-    console.log(userAuth, "auth");
 
-
-    const { message } = await req.json();
-
-    if (!message) {
-      return NextResponse.json(
-        { error: "Message is required" },
-        { status: 400 }
-      );
+    if (!userAuth) {
+      return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
 
-    const googleSuiteAgent = new Agent({
+    const { messages } = await req.json();
+
+    const result = streamText({
       model: groq("openai/gpt-oss-120b"),
-      stopWhen: stepCountIs(10),
+      messages: convertToModelMessages(messages),
       tools: {
-        readEmail: tool({
+        readEmail: {
           description:
-            "Get the emails based on user demands. Supports Gmail search queries like 'is:unread', 'from:email@example.com', 'subject:keyword'",
+            "Search and retrieve emails from Gmail. Use Gmail query syntax: 'is:unread' for unread emails, 'from:user@example.com' to filter by sender, 'subject:keyword' for subject search, 'after:2024/01/01' for date filters.",
           inputSchema: z.object({
             query: z
               .string()
-              .describe("The Gmail search query to filter emails"),
+              .describe(
+                "Gmail search query like 'is:unread from:boss@company.com'"
+              ),
           }),
           execute: async ({ query }) => {
+            console.log(`Executing readEmail with query: ${query}`);
             const emailList = await readEmailFunction(query);
             return emailList;
           },
-        }),
+        },
 
-        sendEmail: tool({
-          description: "Send email on behalf of user via Gmail",
+        sendEmail: {
+          description:
+            "Send an email via Gmail. Extract recipient, subject, and body from user's request.",
           inputSchema: z.object({
-            to: z.string().describe("The recipient email address"),
-            emailSubject: z.string().describe("The subject of the email"),
-            emailBody: z.string().describe("The body content of the email"),
+            to: z.string().describe("Recipient email address"),
+            emailSubject: z.string().describe("Email subject line"),
+            emailBody: z.string().describe("Full email body content"),
           }),
           execute: async ({ to, emailSubject, emailBody }) => {
+            console.log(`Sending email to: ${to}`);
             const result = await sendEmailFunction(to, emailSubject, emailBody);
             return result;
           },
-        }),
+        },
 
-        readDocs: tool({
-          description: "Read a google document or commonly called google docs",
+        readDocs: {
+          description: "Read content from a Google Docs document.",
           inputSchema: z.object({
-            documentId: z
-              .string()
-              .describe("The id of the document to be read"),
+            documentId: z.string().describe("Google Docs document ID"),
           }),
           execute: async ({ documentId }) => {
             const result = await readDocument(documentId);
             return result;
           },
-        }),
+        },
 
-        createDocs: tool({
-          description: "Create a document via google docs",
+        createDocs: {
+          description: "Create a new Google Docs document.",
           inputSchema: z.object({
-            title: z.string().describe("The title of the document"),
-            content: z
-              .string()
-              .describe("The content to be written inside")
-              .optional(),
+            title: z.string().describe("Document title"),
+            content: z.string().describe("Initial document content").optional(),
           }),
           execute: async ({ title, content }) => {
             const result = await createDocument(title, content);
             return result;
           },
-        }),
+        },
+
+        checkCalenderFreeSlot: {
+          description: "Used to find free slots in calender",
+          inputSchema: z.object({
+            startTime: z.date().describe("look up start time"),
+            endTime: z.date().describe("Until which date"),
+            durationMinutes: z.number().describe("Duration of slot"),
+          }),
+          execute: async ({ startTime, endTime, durationMinutes }) => {
+            return await findFreeSlots(startTime, endTime, durationMinutes);
+          },
+        },
+
+        readSheet: {
+          description:
+            "Read data from a Google Sheets spreadsheet. Returns cell values as a 2D array. You can read an entire sheet or specify a specific range of cells",
+          inputSchema: z.object({
+            spreadsheetId: z
+              .string()
+              .describe(
+                "The ID of the spreadsheet (found in the URL: docs.google.com/spreadsheets/d/{spreadsheetId})"
+              ),
+            range: z
+              .string()
+              .optional()
+              .describe(
+                'Optional. The range to read in A1 notation. Examples: "Sheet1" (entire sheet), "Sheet2!A1:D10" (specific cells in Sheet2), "Budget!A:C" (columns A-C in Budget sheet). If omitted, reads all data from the first sheet.'
+              ),
+          }),
+          execute: async ({ spreadsheetId, range }) => {
+            return await readSheet(spreadsheetId, range);
+          },
+        },
+
+        createSheet: {
+          description:
+            "Create a new Google Sheets spreadsheet. Returns the spreadsheet ID and URL.",
+          inputSchema: z.object({
+            title: z.string().describe("The name/title of the new spreadsheet"),
+            sheetNames: z
+              .array(z.string())
+              .optional()
+              .describe(
+                'Optional. Names for the initial sheets/tabs. If not provided, creates a default "Sheet1".'
+              ),
+          }),
+          execute: async ({ title, sheetNames }) => {
+            return await createSpreadSheet(title, sheetNames);
+          },
+        },
       },
-      system: `You are a helpful Google assistant. You can:
-- Read and search emails using Gmail search syntax
-- Send emails on behalf of the user
-- Provide summaries and insights from emails
-- Read google docs document given a valid id
+      system: `You are a Google Workspace automation agent. Your job is to COMPLETE tasks using the available tools.
 
-Always be clear about what actions you're taking and only confirm before sending emails if ambigious, if the user mentions dont ask or re-confirm just do the job and help the user with a summary of what you did.`,
+CRITICAL RULES:
+1. ALWAYS use tools to perform actions - never just describe what you would do
+2. When asked to check/read emails → use readEmail immediately
+3. When asked to send email → use sendEmail immediately  
+4. After using a tool, confirm what you did with specific details
+5. If info is missing, ask ONCE, then execute when provided
+6. Make reasonable assumptions rather than overthinking
+
+Be concise and action-oriented. Execute tasks, don't just talk about them.`,
+      stopWhen: stepCountIs(10),
     });
 
-    const result = await googleSuiteAgent.generate({
-      prompt: message,
-    });
-
-    
-    console.log("Agent result:", JSON.stringify(result, null, 2));
-
-    const responseText = result.text;
-
-    return NextResponse.json({
-      success: true,
-      response: responseText,
-      steps: result.steps?.length || 0,
-      debug: {
-        hasText: !!result.text,
-        hasResponse: !!result.response,
-        // hasMessages: !!result.messages,
-        toolResults: result.toolResults,
-      },
-    });
+    return result.toUIMessageStreamResponse();
   } catch (error: any) {
-    console.error("Agent error:", error);
+    console.error("Stream error:", error);
     return NextResponse.json(
       { error: error.message || "Something went wrong" },
       { status: 500 }
